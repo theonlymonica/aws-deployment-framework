@@ -7,6 +7,10 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
   AWS_REGION: us-east-1
   BOOTSTRAP_BUCKET: ${{ secrets.BOOTSTRAP_BUCKET }}
