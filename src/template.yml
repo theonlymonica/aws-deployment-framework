@@ -138,6 +138,24 @@ Parameters:
       - "Yes"
       - "No"
 
+  BootstrapSourceProvider:
+    Type: String
+    Default: CodeCommit
+    AllowedValues:
+      - CodeCommit
+      - S3
+    Description: >-
+      Provider for the bootstrap pipeline source stage. Use CodeCommit to keep
+      the existing behaviour or S3 to consume an object uploaded to the
+      BootstrapTemplatesBucket.
+
+  BootstrapSourceObjectKey:
+    Type: String
+    Default: "bootstrap-source/bootstrap_repository.zip"
+    Description: >-
+      Object key inside the BootstrapTemplatesBucket that contains the
+      bootstrap repository archive when BootstrapSourceProvider is S3.
+
   GrantOrgWidePrivilegedBootstrapAccessUntil:
     Description: >-
       When set at a date in the future, ADF will use the privileged
@@ -171,6 +189,9 @@ Conditions:
   CreateCrossAccountAccessRole: !Equals
     - !Ref AllowBootstrappingOfManagementAccount
     - "Yes"
+  UseCodeCommitBootstrap: !Equals
+    - !Ref BootstrapSourceProvider
+    - CodeCommit
 
 Resources:
   BootstrapTemplatesBucketPolicy:
@@ -195,30 +216,24 @@ Resources:
                 "aws:PrincipalArn":
                   - !Sub "arn:${AWS::Partition}:iam::*:role/${CrossAccountAccessRoleName}"
                   - !Sub "arn:${AWS::Partition}:iam::*:role/adf/bootstrap/adf-bootstrap-update-deployment-role"
-          - Sid: "DenyInsecureConnections"
-            Action:
-              - "s3:*"
-            Effect: Deny
-            Condition:
-              Bool:
-                aws:SecureTransport: "false"
-            Resource:
-              - !Sub arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucket}
-              - !Sub arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucket}/*
-            Principal:
-              AWS: "*"
-          - Sid: "DenyInsecureTLS"
-            Action:
-              - "s3:*"
-            Effect: Deny
-            Condition:
-              NumericLessThan:
-                "s3:TlsVersion": "1.2"
-            Resource:
-              - !Sub arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucket}
-              - !Sub arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucket}/*
-            Principal:
-              AWS: "*"
+          - !If
+            - UseCodeCommitBootstrap
+            - !Ref AWS::NoValue
+            - Sid: "AllowBootstrapSourceForPipeline"
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:GetObjectVersionTagging
+                - s3:GetObjectTagging
+                - s3:GetObjectAcl
+                - s3:ListBucket
+              Resource:
+                - !Sub arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucket}/bootstrap-source/*
+                - !Sub arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucket}
+              Principal:
+                AWS:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/bootstrap-pipeline/adf-bootstrap-codepipeline"
 
   BootstrapArtifactStorageBucket:
     Type: AWS::S3::Bucket
@@ -1612,6 +1627,7 @@ Resources:
                 Resource: "*"
 
   CodeCommitRepository:
+    Condition: UseCodeCommitBootstrap
     Type: AWS::CodeCommit::Repository
     Properties:
       RepositoryName: "aws-deployment-framework-bootstrap"
@@ -1744,21 +1760,38 @@ Resources:
       RoleArn: !GetAtt BootstrapCodePipelineRole.Arn
       Name: "aws-deployment-framework-bootstrap-pipeline"
       Stages:
-        - Name: CodeCommit
-          Actions:
-            - Name: Source
-              ActionTypeId:
-                Category: Source
-                Owner: AWS
-                Version: "1"
-                Provider: CodeCommit
-              OutputArtifacts:
-                - Name: "TemplateSource"
-              Configuration:
-                BranchName: !GetAtt DetermineDefaultBranchName.DefaultBranchName
-                RepositoryName: !GetAtt CodeCommitRepository.Name
-                PollForSourceChanges: false
-              RunOrder: 1
+        - !If
+          - UseCodeCommitBootstrap
+          - Name: CodeCommit
+            Actions:
+              - Name: Source
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: "1"
+                  Provider: CodeCommit
+                OutputArtifacts:
+                  - Name: "TemplateSource"
+                Configuration:
+                  BranchName: !GetAtt DetermineDefaultBranchName.DefaultBranchName
+                  RepositoryName: !GetAtt CodeCommitRepository.Name
+                  PollForSourceChanges: false
+                RunOrder: 1
+          - Name: BootstrapSource
+            Actions:
+              - Name: Source
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: "1"
+                  Provider: S3
+                OutputArtifacts:
+                  - Name: "TemplateSource"
+                Configuration:
+                  S3Bucket: !Ref BootstrapTemplatesBucket
+                  S3ObjectKey: !Ref BootstrapSourceObjectKey
+                  PollForSourceChanges: false
+                RunOrder: 1
         - Name: EnableBootstrappingViaJumpRole
           Actions:
             - Name: EnableBootstrappingViaJumpRole
@@ -1840,6 +1873,23 @@ Resources:
                 Resource:
                   - !GetAtt "BootstrapArtifactStorageBucket.Arn"
                   - !Sub "${BootstrapArtifactStorageBucket.Arn}/*"
+              - !If
+                - UseCodeCommitBootstrap
+                - !Ref AWS::NoValue
+                - Effect: "Allow"
+                  Action:
+                    - "s3:GetObject"
+                    - "s3:GetObjectVersion"
+                    - "s3:GetObjectVersionTagging"
+                    - "s3:GetObjectTagging"
+                    - "s3:GetObjectAcl"
+                    - "s3:GetBucketLocation"
+                    - "s3:GetBucketVersioning"
+                    - "s3:ListBucket"
+                    - "s3:ListBucketVersions"
+                  Resource:
+                    - !GetAtt BootstrapTemplatesBucket.Arn
+                    - !Sub "${BootstrapTemplatesBucket.Arn}/*"
               - Effect: Allow
                 Sid: "CodeBuild"
                 Action:
@@ -1847,16 +1897,19 @@ Resources:
                   - "codebuild:StartBuild"
                 Resource:
                   - !GetAtt CodeBuildProject.Arn
-              - Effect: Allow
-                Sid: "CodeCommit"
-                Action:
-                  - "codecommit:GetBranch"
-                  - "codecommit:GetCommit"
-                  - "codecommit:UploadArchive"
-                  - "codecommit:GetUploadArchiveStatus"
-                  - "codecommit:CancelUploadArchive"
-                Resource:
-                  - !GetAtt CodeCommitRepository.Arn
+              - !If
+                - UseCodeCommitBootstrap
+                - Effect: Allow
+                  Sid: "CodeCommit"
+                  Action:
+                    - "codecommit:GetBranch"
+                    - "codecommit:GetCommit"
+                    - "codecommit:UploadArchive"
+                    - "codecommit:GetUploadArchiveStatus"
+                    - "codecommit:CancelUploadArchive"
+                  Resource:
+                    - !GetAtt CodeCommitRepository.Arn
+                - !Ref AWS::NoValue
               - Effect: Allow
                 Sid: "Lambda"
                 Action:
@@ -2141,6 +2194,7 @@ Resources:
         }
 
   DetermineDefaultBranchName:
+    Condition: UseCodeCommitBootstrap
     Type: Custom::DetermineDefaultBranchName
     Properties:
       ServiceToken: !GetAtt DetermineDefaultBranchNameHandler.Arn
@@ -2148,13 +2202,17 @@ Resources:
       RepositoryArn: !GetAtt CodeCommitRepository.Arn
 
   DetermineDefaultBranchNameHandler:
+    Condition: UseCodeCommitBootstrap
     Type: AWS::Serverless::Function
     Properties:
       Handler: handler.lambda_handler
       CodeUri: lambda_codebase/initial_commit/bootstrap_repository/adf-bootstrap/deployment/lambda_codebase/determine_default_branch
-      Description: !Sub >-
-        ADF - Installer - Determine the default branch of the
-        ${CodeCommitRepository.Name} repository.
+      Description: !If
+        - UseCodeCommitBootstrap
+        - !Sub |-
+            ADF - Installer - Determine the default branch of the
+            ${CodeCommitRepository.Name} repository.
+        - "ADF - Installer - Determine the default branch for the S3 bootstrap source."
       Policies:
         - Version: "2012-10-17"
           Statement:
@@ -2171,7 +2229,10 @@ Resources:
     Properties:
       ServiceToken: !GetAtt InitialCommitHandler.Arn
       Version: !FindInMap ["Metadata", "ADF", "Version"]
-      RepositoryArn: !GetAtt CodeCommitRepository.Arn
+      RepositoryArn: !If
+        - UseCodeCommitBootstrap
+        - !GetAtt CodeCommitRepository.Arn
+        - ""
       DirectoryName: bootstrap_repository
       ExistingAccountId: !GetAtt DeploymentAccount.AccountId
       DeploymentAccountRegion: !Ref DeploymentAccountMainRegion
@@ -2182,31 +2243,51 @@ Resources:
       TargetRegions: !Ref DeploymentAccountTargetRegions
       ProtectedOUs: !Ref ProtectedOUs
       NotificationEndpoint: !Ref MainNotificationEndpoint
-      DefaultBranchName: !GetAtt DetermineDefaultBranchName.DefaultBranchName
+      DefaultBranchName: !If
+        - UseCodeCommitBootstrap
+        - !GetAtt DetermineDefaultBranchName.DefaultBranchName
+        - ""
+      BootstrapSourceProvider: !Ref BootstrapSourceProvider
+      BootstrapSourceObjectKey: !Ref BootstrapSourceObjectKey
+      BootstrapSourceBucket: !Ref BootstrapTemplatesBucket
 
   InitialCommitHandler:
     Type: AWS::Serverless::Function
     Properties:
       Handler: handler.lambda_handler
       CodeUri: lambda_codebase/initial_commit
-      Description: !Sub >-
-        ADF - Installer - Initial Commit Bootstrap.
+      Description: !If
+        - UseCodeCommitBootstrap
+        - !Sub |-
+            ADF - Installer - Initial Commit Bootstrap.
 
-        Creates the initial commit or update PR on the default branch of the
-        ${CodeCommitRepository.Name} repository. As required to install/update
-        ADF.
+            Creates the initial commit or update PR on the default branch of the
+            ${CodeCommitRepository.Name} repository. As required to install/update
+            ADF.
+        - "ADF - Installer - Initial Commit Bootstrap using S3 as the source provider."
       Policies:
         - Version: "2012-10-17"
           Statement:
+            - !If
+              - UseCodeCommitBootstrap
+              - Effect: Allow
+                Action:
+                  - codecommit:CreateBranch
+                  - codecommit:CreateCommit
+                  - codecommit:CreatePullRequest
+                  - codecommit:DeleteBranch
+                  - codecommit:GetBranch
+                  - codecommit:GetDifferences
+                Resource: !GetAtt CodeCommitRepository.Arn
+              - !Ref AWS::NoValue
             - Effect: Allow
               Action:
-                - codecommit:CreateBranch
-                - codecommit:CreateCommit
-                - codecommit:CreatePullRequest
-                - codecommit:DeleteBranch
-                - codecommit:GetBranch
-                - codecommit:GetDifferences
-              Resource: !GetAtt CodeCommitRepository.Arn
+                - s3:PutObject
+                - s3:PutObjectAcl
+                - s3:DeleteObject
+                - s3:GetObject
+              Resource:
+                - !Sub "${BootstrapTemplatesBucket.Arn}/*"
       FunctionName: BootstrapCreateInitialCommitFunction
     Metadata:
       BuildMethod: python3.12
@@ -2256,24 +2337,6 @@ Resources:
               StringEquals:
                 "aws:SourceOrgID":
                   - !GetAtt Organization.OrganizationId
-          - Sid: "DenyInsecureConnections"
-            Action:
-              - "s3:*"
-            Effect: Deny
-            Condition:
-              Bool:
-                aws:SecureTransport: "false"
-            Principal:
-              AWS: "*"
-          - Sid: "DenyInsecureTLS"
-            Action:
-              - "s3:*"
-            Effect: Deny
-            Condition:
-              NumericLessThan:
-                "s3:TlsVersion": "1.2"
-            Principal:
-              AWS: "*"
 
   CleanupLegacyStacks:
     Type: Custom::CleanupLegacyStacks
@@ -2630,6 +2693,7 @@ Resources:
       BuildMethod: python3.12
 
   PipelineCloudWatchEventRole:
+    Condition: UseCodeCommitBootstrap
     Type: AWS::IAM::Role
     Properties:
       Path: "/adf/bootstrap-pipeline/"
@@ -2654,6 +2718,7 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}"
 
   PipelineCloudWatchEventRule:
+    Condition: UseCodeCommitBootstrap
     Type: "AWS::Events::Rule"
     Properties:
       Name: "adf-bootstrap-pipeline-watch-repo"
@@ -2684,13 +2749,20 @@ Outputs:
       Name: "ADFVersionNumber"
 
   CodeCommitHttpURL:
-    Description: "The CodeCommit HTTP Url"
-    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+    Description: "Bootstrap source location"
+    Value: !If
+      - UseCodeCommitBootstrap
+      - !GetAtt CodeCommitRepository.CloneUrlHttp
+      - !Sub "s3://${BootstrapTemplatesBucket}/${BootstrapSourceObjectKey}"
     Export:
       Name: "BaseTemplatesRepoHttpURL"
 
   CodeCommitSshURL:
-    Description: "The CodeCommit SSH Url"
-    Value: !GetAtt CodeCommitRepository.CloneUrlSsh
+    Condition: UseCodeCommitBootstrap
+    Description: "Bootstrap CodeCommit SSH URL (empty when using S3)"
+    Value: !If
+      - UseCodeCommitBootstrap
+      - !GetAtt CodeCommitRepository.CloneUrlSsh
+      - ""
     Export:
       Name: "BaseTemplatesRepoSSHURL"

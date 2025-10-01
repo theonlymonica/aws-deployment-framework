@@ -6,6 +6,7 @@ The Initial Commit main that is called when ADF is installed to commit the
 initial bootstrap repository content.
 """
 
+import io
 import os
 import logging
 from typing import Mapping, Optional, Union, List, Dict, Any, Tuple
@@ -14,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from datetime import datetime, timezone
 import re
+import zipfile
 import boto3
 import jinja2
 from cfn_custom_resource import (  # pylint: disable=unused-import
@@ -31,6 +33,7 @@ Data = Mapping[str, str]
 HERE = Path(__file__).parent
 NOT_YET_CREATED = "NOT_YET_CREATED"
 CC_CLIENT = boto3.client("codecommit")
+S3_CLIENT = boto3.client("s3")
 CONFIG_FILE_REGEX = re.compile(r"\A.*[.](yaml|yml|json)\Z", re.I)
 REWRITE_PATHS: Dict[str, str] = {
     "bootstrap_repository/adf-bootstrap/example-global-iam.yml": (
@@ -91,6 +94,9 @@ class CustomResourceProperties:
     NotificationEndpoint: Optional[str] = None
     NotificationEndpointType: Optional[str] = None
     ProtectedOUs: Optional[List[str]] = None
+    BootstrapSourceProvider: Optional[str] = "CodeCommit"
+    BootstrapSourceBucket: Optional[str] = None
+    BootstrapSourceObjectKey: Optional[str] = None
 
     def __post_init__(self):
         if self.NotificationEndpoint:
@@ -210,6 +216,11 @@ def chunks(list_to_chunk, number_to_chunk_into):
     )
 
 
+def is_codecommit_provider(props: CustomResourceProperties) -> bool:
+    provider = (props.BootstrapSourceProvider or "CodeCommit").lower()
+    return provider == "codecommit"
+
+
 def generate_commit_input(
     repo_name,
     version,
@@ -285,6 +296,49 @@ def determine_unique_branch_name(repo_name, branch_name):
     return f"{branch_name}-at-{timestamp}"
 
 
+def collect_bootstrap_files(
+    event: Event,
+    directory: str,
+    directory_path: Path,
+    create_first_branch: bool,
+) -> List[FileToCommit]:
+    files_to_commit = get_files_to_commit(directory_path)
+
+    if create_first_branch and directory == "bootstrap_repository":
+        adf_config = create_adf_config_file(
+            event.ResourceProperties,
+            "adfconfig.yml.j2",
+            "/tmp/adfconfig.yml",
+        )
+        initial_sample_global_iam = create_adf_config_file(
+            event.ResourceProperties,
+            "bootstrap_repository/adf-bootstrap/example-global-iam.yml",
+            "/tmp/global-iam.yml",
+        )
+        initial_deploy_sample_global_iam = create_adf_config_file(
+            event.ResourceProperties,
+            "bootstrap_repository/adf-bootstrap/deployment/example-global-iam.yml",
+            "/tmp/global-deploy-iam.yml",
+        )
+
+        create_deployment_account = (
+            event.ResourceProperties.DeploymentAccountFullName
+            and event.ResourceProperties.DeploymentAccountEmailAddress
+        )
+        if create_deployment_account:
+            adf_deployment_account_yml = create_adf_config_file(
+                event.ResourceProperties,
+                "adf.yml.j2",
+                "/tmp/adf.yml",
+            )
+            files_to_commit.append(adf_deployment_account_yml)
+        files_to_commit.append(adf_config)
+        files_to_commit.append(initial_sample_global_iam)
+        files_to_commit.append(initial_deploy_sample_global_iam)
+
+    return files_to_commit
+
+
 def generate_commits(event, repo_name, directory, parent_commit_id=None):
     """
     Generate the commits for the specified repository.
@@ -320,40 +374,13 @@ def generate_commits(event, repo_name, directory, parent_commit_id=None):
         branch_name = default_branch_name
 
     # CodeCommit only allows 100 files per commit, so we chunk them up here
-    files_to_commit = get_files_to_commit(directory_path)
     create_first_branch = parent_commit_id is None
-
-    if create_first_branch and directory == "bootstrap_repository":
-        adf_config = create_adf_config_file(
-            event.ResourceProperties,
-            "adfconfig.yml.j2",
-            "/tmp/adfconfig.yml",
-        )
-        initial_sample_global_iam = create_adf_config_file(
-            event.ResourceProperties,
-            "bootstrap_repository/adf-bootstrap/example-global-iam.yml",
-            "/tmp/global-iam.yml",
-        )
-        initial_deploy_sample_global_iam = create_adf_config_file(
-            event.ResourceProperties,
-            "bootstrap_repository/adf-bootstrap/deployment/example-global-iam.yml",
-            "/tmp/global-deploy-iam.yml",
-        )
-
-        create_deployment_account = (
-            event.ResourceProperties.DeploymentAccountFullName
-            and event.ResourceProperties.DeploymentAccountEmailAddress
-        )
-        if create_deployment_account:
-            adf_deployment_account_yml = create_adf_config_file(
-                event.ResourceProperties,
-                "adf.yml.j2",
-                "/tmp/adf.yml",
-            )
-            files_to_commit.append(adf_deployment_account_yml)
-        files_to_commit.append(adf_config)
-        files_to_commit.append(initial_sample_global_iam)
-        files_to_commit.append(initial_deploy_sample_global_iam)
+    files_to_commit = collect_bootstrap_files(
+        event,
+        directory,
+        directory_path,
+        create_first_branch,
+    )
 
     chunked_files = chunks([f.as_dict() for f in files_to_commit], 99)
     commit_id = parent_commit_id
@@ -422,6 +449,49 @@ def generate_commits(event, repo_name, directory, parent_commit_id=None):
     return commits_created
 
 
+def upload_bootstrap_bundle_to_s3(event: Event, directory: str) -> Dict[str, str]:
+    props = event.ResourceProperties
+    bucket = props.BootstrapSourceBucket
+    key = props.BootstrapSourceObjectKey
+    if not bucket or not key:
+        raise ValueError(
+            "BootstrapSourceBucket and BootstrapSourceObjectKey must be set "
+            "when using the S3 bootstrap provider."
+        )
+
+    directory_path = HERE / directory
+    files_to_commit = collect_bootstrap_files(event, directory, directory_path, True)
+
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_to_commit in files_to_commit:
+            zip_info = zipfile.ZipInfo(file_to_commit.filePath)
+            mode = 0o755 if file_to_commit.fileMode == FileMode.EXECUTABLE else 0o644
+            zip_info.external_attr = mode << 16
+            archive.writestr(zip_info, file_to_commit.fileContent)
+
+    bundle.seek(0)
+    metadata = {
+        "adf-version": props.Version or "unknown",
+        "bootstrap-source": "s3",
+    }
+
+    S3_CLIENT.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=bundle.getvalue(),
+        ContentType="application/zip",
+        Metadata=metadata,
+    )
+    LOGGER.info(
+        "Uploaded bootstrap archive to s3://%s/%s", bucket, key,
+    )
+    return {
+        "BootstrapSourceBucket": bucket,
+        "BootstrapSourceObjectKey": key,
+    }
+
+
 def get_commit_id_from_branch(repo_name, branch_name):
     try:
         return CC_CLIENT.get_branch(
@@ -444,9 +514,18 @@ def create_(
     _context: Any,
 ) -> Tuple[Union[None, PhysicalResourceId], Data]:
     create_event = CreateEvent(**event)
+    directory = create_event.ResourceProperties.DirectoryName
+
+    if not is_codecommit_provider(create_event.ResourceProperties):
+        upload_info = upload_bootstrap_bundle_to_s3(create_event, directory)
+        physical_id = (
+            f"BootstrapBundle::{upload_info['BootstrapSourceBucket']}::"
+            f"{upload_info['BootstrapSourceObjectKey']}"
+        )
+        return physical_id, upload_info
+
     repo_name = repo_arn_to_name(create_event.ResourceProperties.RepositoryArn)
     default_branch_name = create_event.ResourceProperties.DefaultBranchName
-    directory = create_event.ResourceProperties.DirectoryName
 
     parent_commit_id = get_commit_id_from_branch(
         repo_name,
@@ -471,6 +550,16 @@ def update_(
     _context: Any,
 ) -> Tuple[PhysicalResourceId, Data]:
     update_event = UpdateEvent(**event)
+    directory = update_event.ResourceProperties.DirectoryName
+
+    if not is_codecommit_provider(update_event.ResourceProperties):
+        upload_info = upload_bootstrap_bundle_to_s3(update_event, directory)
+        physical_id = (
+            f"BootstrapBundle::{upload_info['BootstrapSourceBucket']}::"
+            f"{upload_info['BootstrapSourceObjectKey']}"
+        )
+        return physical_id, upload_info
+
     repo_name = repo_arn_to_name(update_event.ResourceProperties.RepositoryArn)
     default_branch_name = update_event.ResourceProperties.DefaultBranchName
 
@@ -481,7 +570,7 @@ def update_(
     generate_commits(
         update_event,
         repo_name,
-        directory=update_event.ResourceProperties.DirectoryName,
+        directory=directory,
         parent_commit_id=parent_commit_id,
     )
 

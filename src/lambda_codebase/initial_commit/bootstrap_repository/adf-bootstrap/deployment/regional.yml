@@ -63,8 +63,14 @@ Resources:
             Resource:
               - !Sub arn:${AWS::Partition}:s3:::${DeploymentFrameworkRegionalS3Bucket}
               - !Sub arn:${AWS::Partition}:s3:::${DeploymentFrameworkRegionalS3Bucket}/*
-            Principal:
-              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-cloudformation-role
+            Principal: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:PrincipalArn:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-cloudformation-role
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codepipeline-role
           - Sid: "DenyUnencryptedObjects"
             Action:
               - "s3:PutObject"
