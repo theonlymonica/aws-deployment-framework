@@ -10,7 +10,7 @@ This note captures **all** of the changes and runbooks required to operate the b
 |------|---------|
 | `src/template.yml` | Adds `BootstrapSourceProvider` / `BootstrapSourceObjectKey` parameters, toggles CodePipeline stages based on provider, extends IAM + bucket policies, and teaches the `InitialCommit` custom resource to bundle the repository into S3 (preserving executable bits). |
 | `src/lambda_codebase/initial_commit/bootstrap_repository/adf-bootstrap/deployment/regional.yml` | Rewrites `DeploymentFrameworkRegionalPipelineBucketPolicy` to avoid hard-coded principals. Creation succeeds even when roles are created later in the template. |
-| `src/lambda_codebase/initial_commit/bootstrap_repository/adf-bootstrap/global.yml` | (Currently untouched – include only if future edits happen.) |
+| `src/lambda_codebase/initial_commit/bootstrap_repository/adf-bootstrap/deployment/global.yml` | Enables the pipelines CodePipeline to source from AWS CodeConnections (GitHub) instead of CodeCommit via new parameters and conditional resources. |
 | `docs/s3-bootstrap-migration.md` | This document. |
 
 Everything else remains stock ADF.
@@ -29,6 +29,8 @@ Everything else remains stock ADF.
 ## 3. Updating the bootstrap repository contents
 
 The bootstrap archive **must** contain runtime files (`adfconfig.yml`, generated examples, etc.), not only the sources under `src/…`. The safe way is to start from the archive created by the Lambda during the initial install, overlay the local changes, and rebuild.
+
+> Note: the deployment map (`deployment_map.yml`) now lives in the separate pipelines repository. Do not include it in the bootstrap archive.
 
 ### 3.1 Retrieve the last good archive (optional but recommended)
 
@@ -160,7 +162,33 @@ Keep CloudTrail/CloudWatch logs handy: they pinpoint the exact failing action.
 
 ---
 
-## 7. Automating the upload (TODO)
+## 7. Pipelines repository via CodeConnections
+
+With CodeCommit retired, the "pipelines" CodePipeline now reads the deployment map from a Git repository exposed through AWS CodeConnections. Steps to prepare it:
+
+1. **Create/identify the repository** that will host `deployment_map.yml` (and optional files under `deployment_maps/`). The root of the repo must contain the YAML exactly like the legacy `aws-deployment-framework-pipelines` repo.
+2. **Create a CodeConnections connection** in the deployment account (Developer Tools → CodeConnections). Authorize the GitHub App to access the repository above.
+3. **Create the SSM parameters** in the deployment account before the next bootstrap run. Start with the CodeCommit defaults so the updated template continues to work:
+   ```bash
+   aws ssm put-parameter --name /adf/pipelines_repository/provider --type String --value CodeCommit --overwrite
+   aws ssm put-parameter --name /adf/pipelines_repository/codeconnections_arn --type String --value placeholder --overwrite
+   aws ssm put-parameter --name /adf/pipelines_repository/full_repository_id --type String --value placeholder --overwrite
+   aws ssm put-parameter --name /adf/pipelines_repository/branch --type String --value main --overwrite
+   ```
+   (The placeholders can be any non-empty value.)
+4. **When ready to move to CodeConnections**, update the same parameters as follows:
+   ```bash
+   aws ssm put-parameter --name /adf/pipelines_repository/provider --type String --value CodeConnections --overwrite
+   aws ssm put-parameter --name /adf/pipelines_repository/codeconnections_arn --type String --value <CONNECTION_ARN> --overwrite
+   aws ssm put-parameter --name /adf/pipelines_repository/full_repository_id --type String --value <owner/repository> --overwrite
+   aws ssm put-parameter --name /adf/pipelines_repository/branch --type String --value main --overwrite
+   ```
+   Replace `main` if you use a different branch.
+5. Push the deployment map to the repository and grant the GitHub Action access through the same connection (if required by GitHub).
+
+On the next bootstrap pipeline run, the deployment account will recreate the `aws-deployment-framework-pipelines` CodePipeline pointing at the GitHub repository. From then on, updating the deployment map only requires committing to that repo.
+
+## 8. Automating the upload (TODO)
 
 - Add a GitHub Action (or GitLab pipeline) that runs on push:
   1. `rsync` + `zip` the bootstrap repository.

@@ -71,9 +71,32 @@ Parameters:
     Type: "AWS::SSM::Parameter::Value<String>"
     Default: /adf/extensions/terraform/enabled
 
+  PipelinesSourceProvider:
+    Type: "AWS::SSM::Parameter::Value<String>"
+    Default: /adf/pipelines_repository/provider
+
+  PipelinesConnectionArn:
+    Type: "AWS::SSM::Parameter::Value<String>"
+    Default: /adf/pipelines_repository/codeconnections_arn
+    Description: Arn of the AWS CodeConnections connection for the pipelines repository (used when PipelinesSourceProvider is CodeConnections)
+
+  PipelinesRepositoryId:
+    Type: "AWS::SSM::Parameter::Value<String>"
+    Default: /adf/pipelines_repository/full_repository_id
+    Description: Full repository id (for example owner/repository) when using CodeConnections
+
+  PipelinesBranch:
+    Type: "AWS::SSM::Parameter::Value<String>"
+    Default: /adf/pipelines_repository/branch
+    Description: Branch to monitor when using CodeConnections as pipelines source
+
 Conditions:
   ADFTerraformExtensionEnabled:
     !Equals [!Ref ADFTerraformExtension, "True"]
+  UseCodeCommitPipelines:
+    !Equals [!Ref PipelinesSourceProvider, "CodeCommit"]
+  UseCodeConnectionsPipelines:
+    !Equals [!Ref PipelinesSourceProvider, "CodeConnections"]
 
 Globals:
   Function:
@@ -130,6 +153,9 @@ Resources:
               - "kms:Revoke*"
               - "kms:ScheduleKeyDeletion"
               - "kms:Update*"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
             Resource: "*"
           - Sid: Allow use of the key
             Effect: Allow
@@ -142,6 +168,9 @@ Resources:
               - kms:GenerateDataKey*
               - kms:ReEncryptFrom
               - kms:ReEncryptTo
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
             Resource: "*"
             Condition:
               StringEquals:
@@ -149,6 +178,9 @@ Resources:
           - Action:
               - kms:Decrypt
               - kms:GenerateDataKey*
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
             Effect: Allow
             Principal:
               Service:
@@ -218,6 +250,7 @@ Resources:
         ADFLogLevel: !Ref ADFLogLevel
 
   CodeCommitRole:
+    Condition: UseCodeCommitPipelines
     Type: AWS::IAM::Role
     Properties:
       Path: /
@@ -241,6 +274,7 @@ Resources:
                 "aws:SourceAccount": !Ref AWS::AccountId
 
   CodeCommitPolicy:
+    Condition: UseCodeCommitPipelines
     Type: AWS::IAM::Policy
     Properties:
       PolicyName: "adf-codecommit-role-policy"
@@ -270,6 +304,10 @@ Resources:
               - "kms:GenerateDataKey"
               - "kms:ReEncryptFrom"
               - "kms:ReEncryptTo"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref CodeCommitRole
@@ -416,6 +454,10 @@ Resources:
               - kms:GenerateDataKey
               - kms:ReEncryptFrom
               - kms:ReEncryptTo
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref CodeBuildRole
@@ -509,6 +551,10 @@ Resources:
               - kms:GenerateDataKey*
               - kms:ReEncryptFrom
               - kms:ReEncryptTo
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
           - Effect: Allow
             Action:
@@ -617,6 +663,10 @@ Resources:
               - kms:GenerateDataKey*
               - kms:ReEncryptFrom
               - kms:ReEncryptTo
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref CloudFormationRole
@@ -679,6 +729,10 @@ Resources:
               - "kms:GenerateDataKey*"
               - "kms:ReEncryptFrom"
               - "kms:ReEncryptTo"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref CloudFormationDeploymentRole
@@ -753,11 +807,16 @@ Resources:
               # These are required for cross account deployments via CodePipeline.
               - "kms:Decrypt"
               - "kms:DescribeKey"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref AdfAutomationRole
 
   CodeCommitRepository:
+    Condition: UseCodeCommitPipelines
     Type: AWS::CodeCommit::Repository
     Properties:
       RepositoryName: "aws-deployment-framework-pipelines"
@@ -879,23 +938,40 @@ Resources:
             Resource:
               - !Sub arn:${AWS::Partition}:s3:::${PipelineBucket}
               - !Sub arn:${AWS::Partition}:s3:::${PipelineBucket}/*
+          - !If
+            - UseCodeCommitPipelines
+            - Effect: Allow
+              Sid: "CodeCommit"
+              Action:
+                - codecommit:GetBranch
+                - codecommit:GetCommit
+                - codecommit:UploadArchive
+                - codecommit:GetUploadArchiveStatus
+                - codecommit:CancelUploadArchive
+              Resource:
+                - !GetAtt CodeCommitRepository.Arn
+            - !Ref AWS::NoValue
+          - !If
+            - UseCodeConnectionsPipelines
+            - Effect: Allow
+              Sid: "CodeConnections"
+              Action:
+                - codeconnections:GetConnection
+                - codeconnections:UseConnection
+              Resource:
+                - !Ref PipelinesConnectionArn
+            - !Ref AWS::NoValue
           - Effect: Allow
-            Sid: "CodeCommit"
             Action:
-              - codecommit:GetBranch
-              - codecommit:GetCommit
-              - codecommit:UploadArchive
-              - codecommit:GetUploadArchiveStatus
-              - codecommit:CancelUploadArchive
-            Resource:
-              - !GetAtt CodeCommitRepository.Arn
-          - Effect: Allow
-            Action:
-              - kms:Decrypt
-              - kms:Encrypt
-              - kms:GenerateDataKey
-              - kms:ReEncryptFrom
-              - kms:ReEncryptTo
+              - "kms:Decrypt"
+              - "kms:Encrypt"
+              - "kms:GenerateDataKey"
+              - "kms:ReEncryptFrom"
+              - "kms:ReEncryptTo"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref PipelineManagementCodePipelineRole
@@ -913,21 +989,38 @@ Resources:
       RestartExecutionOnUpdate: true
       Name: "aws-deployment-framework-pipelines"
       Stages:
-        - Name: CodeCommit
-          Actions:
-            - Name: Source
-              ActionTypeId:
-                Category: Source
-                Owner: AWS
-                Version: "1"
-                Provider: CodeCommit
-              OutputArtifacts:
-                - Name: "Source"
-              Configuration:
-                BranchName: !GetAtt DetermineDefaultBranchName.DefaultBranchName
-                RepositoryName: !GetAtt CodeCommitRepository.Name
-                PollForSourceChanges: false
-              RunOrder: 1
+        - !If
+          - UseCodeCommitPipelines
+          - Name: CodeCommit
+            Actions:
+              - Name: Source
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: "1"
+                  Provider: CodeCommit
+                OutputArtifacts:
+                  - Name: "Source"
+                Configuration:
+                  BranchName: !GetAtt DetermineDefaultBranchName.DefaultBranchName
+                  RepositoryName: !GetAtt CodeCommitRepository.Name
+                  PollForSourceChanges: false
+                RunOrder: 1
+          - Name: CodeConnections
+            Actions:
+              - Name: Source
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Version: "1"
+                  Provider: CodeStarSourceConnection
+                OutputArtifacts:
+                  - Name: "Source"
+                Configuration:
+                  ConnectionArn: !Ref PipelinesConnectionArn
+                  FullRepositoryId: !Ref PipelinesRepositoryId
+                  BranchName: !Ref PipelinesBranch
+                RunOrder: 1
         - Name: KickoffCreateOrUpdatePipelines
           Actions:
             - Name: CreateOrUpdate
@@ -1121,6 +1214,10 @@ Resources:
               - kms:Encrypt
               - kms:GenerateDataKey*
               - kms:ReEncrypt*
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ListResourceTags"
+              - "kms:PutKeyPolicy"
             Resource: !GetAtt KMSKey.Arn
       Roles:
         - !Ref CodePipelineRole
@@ -1185,19 +1282,22 @@ Resources:
               - !Sub arn:${AWS::Partition}:s3:::${PipelineBucket}/*
             Principal:
               AWS: "*"
-          - Sid: "AllowCodeCommitFromOrgSources"
-            Action:
-              - "s3:PutObject"
-            Effect: Allow
-            Condition:
-              StringEquals:
-                aws:PrincipalOrgID: !Ref OrganizationId
-              ArnLike:
-                aws:PrincipalArn: 'arn:aws:iam::*:role/adf-codecommit-role'
-            Resource:
-              - !Sub arn:${AWS::Partition}:s3:::${PipelineBucket}/*
-            Principal:
-              AWS: "*"
+          - !If
+            - UseCodeCommitPipelines
+            - Sid: "AllowCodeCommitFromOrgSources"
+              Action:
+                - "s3:PutObject"
+              Effect: Allow
+              Condition:
+                StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+                ArnLike:
+                  aws:PrincipalArn: 'arn:aws:iam::*:role/adf-codecommit-role'
+              Resource:
+                - !Sub arn:${AWS::Partition}:s3:::${PipelineBucket}/*
+              Principal:
+                AWS: "*"
+            - !Ref AWS::NoValue
           - Sid: "DenyUnencryptedObjects"
             Action:
               - "s3:PutObject"
@@ -1614,6 +1714,7 @@ Resources:
         }
 
   DetermineDefaultBranchName:
+    Condition: UseCodeCommitPipelines
     Type: Custom::DetermineDefaultBranchName
     Properties:
       ServiceToken: !GetAtt DetermineDefaultBranchNameHandler.Arn
@@ -1621,6 +1722,7 @@ Resources:
       RepositoryArn: !GetAtt CodeCommitRepository.Arn
 
   DetermineDefaultBranchNameHandler:
+    Condition: UseCodeCommitPipelines
     Type: AWS::Serverless::Function
     Properties:
       Handler: handler.lambda_handler
@@ -1638,6 +1740,7 @@ Resources:
       BuildMethod: python3.12
 
   InitialCommit:
+    Condition: UseCodeCommitPipelines
     Type: Custom::InitialCommit
     Properties:
       ServiceToken: !GetAtt InitialCommitHandler.Arn
@@ -1647,6 +1750,7 @@ Resources:
       DefaultBranchName: !GetAtt DetermineDefaultBranchName.DefaultBranchName
 
   InitialCommitHandler:
+    Condition: UseCodeCommitPipelines
     Type: AWS::Serverless::Function
     Properties:
       Handler: handler.lambda_handler
@@ -1679,6 +1783,7 @@ Resources:
       Value: !GetAtt KMSKey.Arn
 
   PipelineCloudWatchEventRole:
+    Condition: UseCodeCommitPipelines
     Type: AWS::IAM::Role
     Properties:
       Path: /adf/bootstrap/
@@ -1703,6 +1808,7 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}"
 
   PipelineCloudWatchEventRule:
+    Condition: UseCodeCommitPipelines
     Type: AWS::Events::Rule
     Properties:
       EventPattern:
@@ -1855,6 +1961,8 @@ Resources:
                   - "lambda:GetRuntimeManagementConfig"
                   - "lambda:ListFunctionEventInvokeConfigs"
                   - "lambda:ListTags"
+                  - "lambda:TagResource"
+                  - "lambda:UntagResource"
                   - "lambda:ListVersionsByFunction"
                   - "lambda:PublishVersion"
                   - "lambda:PutFunctionConcurrency"
@@ -1919,7 +2027,6 @@ Resources:
                 Effect: "Deny"
                 Action:
                   - "cloudformation:DeleteStack"
-                  - "cloudformation:UpdateTerminationProtection"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/adf-global-base-deployment-*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/adf-global-base-deployment"
@@ -1928,7 +2035,8 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/adf-global-base-iam/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/adf-regional-base-deployment"
                   - !Sub "arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/adf-regional-base-deployment/*"
-              - Effect: "Allow"
+              - Sid: "CloudFormationScopedToADF"
+                Effect: "Allow"
                 Action:
                   - "cloudformation:CreateChangeSet"
                   - "cloudformation:CreateStack"
@@ -1943,7 +2051,8 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/adf-global-base-deployment/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/adf-global-base-iam/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/adf-regional-base-deployment/*"
-              - Effect: "Allow"
+              - Sid: "GeneralReadOnly"
+                Effect: "Allow"
                 Action:
                   - "cloudformation:ListStacks"
                   - "cloudformation:ValidateTemplate"
@@ -1964,11 +2073,14 @@ Resources:
                   - "iam:ListAccountAliases"
                 Resource:
                   - "*"
-              - Effect: "Allow"
+              - Sid: "SSMParameterStoreADFParameters"
+                Effect: "Allow"
                 Action:
                   - "ssm:GetParameters"
                   - "ssm:GetParameter"
                   - "ssm:PutParameter"
+                  - "ssm:AddTagsToResource"
+                  - "ssm:RemoveTagsFromResource"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/adf/*"
               - Sid: "IAMFullPathOnlyCreateDelete"
@@ -1987,70 +2099,97 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-cloudformation-deployment-role"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-cloudformation-role"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codebuild-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codecommit-role"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codepipeline-role"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-readonly-automation-role"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-terraform-role"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/pipeline-management/adf-pipeline-management-codepipeline"
+                  - !If
+                    - UseCodeCommitPipelines
+                    - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codecommit-role"
+                    - !Ref AWS::NoValue
               - Sid: "IAMFullPathAndNameOnly"
                 Effect: "Allow"
                 Action:
-                  - "iam:DeleteRolePolicy"
-                  - "iam:GetRole"
-                  - "iam:GetRolePolicy"
-                  - "iam:PutRolePolicy"
-                  - "iam:UpdateAssumeRolePolicy"
+                  - "iam:*"
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-cloudformation-deployment-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-cloudformation-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codebuild-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codecommit-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-codepipeline-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-pipeline-check-pipeline-status-lambda"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-pipeline-management-codepipeline"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/adf-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/adf/*"
+              - Sid: "IAMPassSlackNotificationRole"
+                Effect: "Allow"
+                Action:
+                  - "iam:PassRole"
+                Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-pipeline-send-slack-notification-lambda"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-readonly-automation-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-terraform-role"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/bootstrap/adf-pipeline-check-pipeline-status-lambda"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/bootstrap/adf-pipeline-send-slack-notification-lambda"
-                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/pipeline-management/adf-pipeline-management-codepipeline"
+                Condition:
+                  StringEqualsIfExists:
+                    "iam:PassedToService":
+                      - "lambda.amazonaws.com"
               - Sid: "IAMGetOnly"
                 Effect: "Allow"
                 Action:
                   - "iam:GetRole"
                   - "iam:GetRolePolicy"
+                  - "iam:PutRolePolicy"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf-*"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/adf/*"
-              - Effect: "Allow"
+              - Sid: "S3ReadAccessToADFTemplates"
+                Effect: "Allow"
                 Action:
                   - "s3:GetObject"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${BootstrapTemplatesBucketName}/adf-bootstrap/*"
                   - !Sub "arn:${AWS::Partition}:s3:::${SharedModulesBucket}/adf-bootstrap/*"
-              - Effect: "Allow"
+              - Sid: "ManagePipelineBucketPolicy"
+                Effect: "Allow"
                 Action:
-                  - "codecommit:GetRepository"
+                  - "s3:GetBucketPolicy"
+                  - "s3:PutBucketPolicy"
+                  - "s3:DeleteBucketPolicy"
+                  - "s3:PutBucketTagging"
                 Resource:
-                  - !GetAtt CodeCommitRepository.Arn
-              - Effect: "Allow"
+                  - !Sub "arn:${AWS::Partition}:s3:::${PipelineBucket}"
+              - !If
+                - UseCodeCommitPipelines
+                - Sid: "CodeCommitReadRepository"
+                  Effect: "Allow"
+                  Action:
+                    - "codecommit:GetRepository"
+                  Resource:
+                    - !GetAtt CodeCommitRepository.Arn
+                - !Ref AWS::NoValue
+              - Sid: "CodeBuildReadOnly"
+                Effect: "Allow"
                 Action:
                   - "codebuild:BatchGetProjects"
                 Resource:
                   - !GetAtt CodeBuildProject.Arn
-              - Effect: "Allow"
+                  - !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/adf-*"
+              - Sid: "SNSReadOnly"
+                Effect: "Allow"
                 Action:
                   - "sns:GetTopicAttributes"
+                  - "sns:TagResource"
+                  - "sns:UntagResource"
                 Resource:
                   - !Ref PipelineSNSTopic
-              - Effect: Allow
-                Sid: "KickOffPipelineManagement"
+              - Sid: "KickOffPipelineManagement"
+                Effect: Allow
                 Action:
                   - "states:DescribeExecution"
                   - "states:StartExecution"
                 Resource:
                   - !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:adf-bootstrap-enable-cross-account
                   - !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:adf-bootstrap-enable-cross-account:*
+              - Sid: "KMSKeyUsage"
+                Effect: "Allow"
+                Action:
+                  - "kms:*"
+                Resource:
+                  - !GetAtt KMSKey.Arn
 
 Outputs:
   ADFVersionNumber:
@@ -2089,16 +2228,32 @@ Outputs:
       Name: "CloudFormationDeploymentRoleArn"
 
   CodeCommitHttpURL:
+    Condition: UseCodeCommitPipelines
     Description: "The CodeCommit HTTP Url"
     Value: !GetAtt CodeCommitRepository.CloneUrlHttp
     Export:
       Name: "aws-deployment-framework-pipelines-codecommit-http-url"
 
   CodeCommitSshURL:
+    Condition: UseCodeCommitPipelines
     Description: "The CodeCommit SSH Url"
     Value: !GetAtt CodeCommitRepository.CloneUrlSsh
     Export:
       Name: "aws-deployment-framework-pipelines-codecommit-ssh-url"
+
+  PipelinesConnectionArnOutput:
+    Condition: UseCodeConnectionsPipelines
+    Description: "AWS CodeConnections connection Arn used by the pipelines repository"
+    Value: !Ref PipelinesConnectionArn
+    Export:
+      Name: "aws-deployment-framework-pipelines-connection-arn"
+
+  PipelinesRepositoryIdOutput:
+    Condition: UseCodeConnectionsPipelines
+    Description: "Full repository id used by the pipelines repository"
+    Value: !Ref PipelinesRepositoryId
+    Export:
+      Name: "aws-deployment-framework-pipelines-repository-id"
 
   CodePipelineRoleArn:
     Description: "The CodePipeline Arn"

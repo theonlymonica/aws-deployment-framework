@@ -1,0 +1,47 @@
+# Copyright Amazon.com Inc. or its affiliates.
+# SPDX-License-Identifier: MIT-0
+
+roles:
+  cross-account-access: OrganizationAccountAccessRole
+  # ^ The role by ADF to assume cross account access
+
+regions:
+  deployment-account: eu-central-1
+  # ^ The region you define as your main deployment region
+  targets: # A list of regions you wish to bootstrap and also deploy into via pipelines
+    - eu-central-1
+    - eu-west-1
+
+config:
+  main-notification-endpoint:
+    - type: email  # slack or email
+      target: monica.colangelo+adfnotifications@gmail.com
+      # ^ Email/Slack channel who receives notifications for the main bootstrapping pipeline
+  protected:
+    - ou-1r5g-dli3za77
+  moves:
+    - name: to-root
+      action: safe  # Can be safe or remove-base
+  scp:
+    keep-default-scp: enabled
+    # ^ Determines if the default AWSFullAccess SCP stays attached to all OU's
+  scm:
+    auto-create-repositories: disabled
+    default-scm-branch: main
+    # Optional:
+    # default-scm-codecommit-account-id: "123456789012"
+  deployment-maps:
+    allow-empty-target: disabled
+    # ^ Needs to be set to "enabled" to activate. Defaults to "disabled" when
+    # not set.
+
+  bootstrap-pipeline:
+    # Configure whether or not to run tests in the bootstrap pipeline.
+    # Needs to be set to "enabled" to activate. Defaults to "enabled" when not set.
+    run-tests: enabled
+
+# Optional config for multi-organization deployments of ADF:
+#   org:
+#    # Optional: Use this variable to define the AWS Organization in case of
+#    # staged multi-organization ADF deployments
+#    stage: dev
